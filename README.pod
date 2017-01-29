@@ -1,0 +1,3 @@
+=head1 NAME
+
+Tiny::Loop - Tiny event loop

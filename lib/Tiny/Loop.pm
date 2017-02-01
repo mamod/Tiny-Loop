@@ -67,7 +67,7 @@ sub io {
 
 sub io_stop {
 	my $self = shift;
-	# $self->{ io }->add(@_);
+	$self->{ io }->stop(@_);
 }
 
 
@@ -113,7 +113,7 @@ sub start {
 		my $wait = undef;
 		if ($self->{timers}->[0]){
 			$wait = ($self->{timers}->[0]->[0] - $now) / 1000;
-			select(undef, undef, undef, $wait) if !$self->{io}->{nfds};
+			select(undef, undef, undef, $wait) if !$self->{ io }->{nfds};
 		}
 
 		$self->{io}->poll( $wait );
@@ -147,14 +147,28 @@ package Tiny::Loop::Select; {
 	sub add {
 		my $self  = shift;
 		my $fd    = shift;
-		my $event = shift;
+		my $ev    = shift;
 		my $cb    = shift;
 
-		my $io = [$fd, $event, $cb];
+		my $io = [$fd, $ev, $cb];
 		$self->{watchers}->{$fd} = $io;
-		push @{ $self->{queue} }, $io;
-		return $io;
+
+		if ($ev & $POLLIN){
+			vec($self->{events}->[0], $fd, 1) = 1;
+		}
+
+		if ($ev & $POLLOUT){
+			vec($self->{events}->[1], $fd, 1) = 1;
+		}
+
+		if ($ev & $POLLERR){
+			vec($self->{events}->[2], $fd, 1) = 1;
+		}
+
+		$self->{nfds}++;
+		return $self->{watchers}->{$fd};
 	}
+
 
 	## TODO
 	sub stop {
@@ -170,25 +184,6 @@ package Tiny::Loop::Select; {
 		my $loop = $self->{ loop };
 
 		my $watchers = $self->{watchers};
-
-		while (my $w = shift @{ $self->{queue} }){
-
-			my $fd = $w->[0];
-			my $ev = $w->[1];
-
-			if ($ev & $POLLIN){
-				vec($self->{events}->[0], $fd, 1) = 1;
-			}
-
-			if ($ev & $POLLOUT){
-				vec($self->{events}->[1], $fd, 1) = 1;
-			}
-
-			if ($ev & $POLLERR){
-				vec($self->{events}->[2], $fd, 1) = 1;
-			}
-			$self->{nfds}++;
-		}
 
 		my $rout = '';
 		my $wout = '';

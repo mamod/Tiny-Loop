@@ -7,13 +7,17 @@ use Scalar::Util qw(weaken);
 
 our $VERSION = 0.0.1;
 
+our $POLLIN  = 2;
+our $POLLOUT = 4;
+our $POLLERR = 8;
+
 sub new {
 	my $class = shift;
 	my $self = bless {}, $class;
 
 	tie @{ $self->{timers} }, "Tiny::Loop::Array", sub { $_[0]->[0] <=> $_[1]->[0] };
+	$self->{ io }  =  Tiny::Loop::Select->new( $self );
 
-	$self->{ backend }  =  Tiny::Loop::Select->new();
 	$self->update_time();
 	return $self;
 }
@@ -21,7 +25,7 @@ sub new {
 
 sub now { shift->{time} }
 sub update_time {
-    shift->{time} = int( time() * 1000 );
+	shift->{time} = int( time() * 1000 );
 }
 
 
@@ -55,6 +59,18 @@ sub timer_stop {
 }
 
 
+sub io {
+	my $self = shift;
+	$self->{ io }->add(@_);
+}
+
+
+sub io_stop {
+	my $self = shift;
+	# $self->{ io }->add(@_);
+}
+
+
 sub start {
 	my $self = shift;
 	my $total_elapsed = 0;
@@ -67,8 +83,7 @@ sub start {
 		my $now         = $self->now;
 		my $timers_list = $self->{timers};
 
-		TIMER_AGAIN: for (@{ $timers_list }) {
-			my $timer = $timers_list->[0];
+		TIMER_AGAIN: if (my $timer = $timers_list->[0]) {
 
 			if ( $timer->[0] <= $now ){
 
@@ -90,26 +105,189 @@ sub start {
 
 			## it's guranteed that the first timer
 			## is the one should be fired, so if it's
-			## not ready yet exit this loop and try again
-			## later
-			last;
+			## not ready yet then next timers will not
+			## be ready too, so go to the next polling
+			## state io_poll
 		}
 
-		if (!scalar @{ $timers_list } ){ last; }
-		my $wait = ($self->{timers}->[0]->[0] - $now) / 1000;
-		select(undef, undef, undef, $wait);
+		my $wait = undef;
+		if ($self->{timers}->[0]){
+			$wait = ($self->{timers}->[0]->[0] - $now) / 1000;
+			select(undef, undef, undef, $wait) if !$self->{io}->{nfds};
+		}
+
+		$self->{io}->poll( $wait );
+		last if (!scalar @{ $timers_list } ); ## loop break
 	}
 }
 
 
-package Tiny::Loop::Timer; {
-	sub new {}
-};
+
 
 
 package Tiny::Loop::Select; {
-	sub new {}
+	use strict;
+	use warnings;
+	use POSIX qw(:errno_h);
+	use Data::Dumper;
+
+	sub new {
+		my $class = shift;
+		my $loop  = shift;
+		my $self  = bless { loop => $loop }, $class;
+
+		$self->{nfds}     = 0;
+		$self->{queue}    = [];
+		$self->{watchers} = {};
+		$self->{events}   = ['', '', ''];
+		return $self
+	}
+
+
+	sub add {
+		my $self  = shift;
+		my $fd    = shift;
+		my $event = shift;
+		my $cb    = shift;
+
+		my $io = [$fd, $event, $cb];
+		$self->{watchers}->{$fd} = $io;
+		push @{ $self->{queue} }, $io;
+		return $io;
+	}
+
+	## TODO
+	sub stop {
+		my $self  = shift;
+		my $io    = shift;
+	}
+
+
+	sub poll {
+
+		my $self = shift;
+		my $wait = shift;
+		my $loop = $self->{ loop };
+
+		my $watchers = $self->{watchers};
+
+		while (my $w = shift @{ $self->{queue} }){
+
+			my $fd = $w->[0];
+			my $ev = $w->[1];
+
+			if ($ev & $POLLIN){
+				vec($self->{events}->[0], $fd, 1) = 1;
+			}
+
+			if ($ev & $POLLOUT){
+				vec($self->{events}->[1], $fd, 1) = 1;
+			}
+
+			if ($ev & $POLLERR){
+				vec($self->{events}->[2], $fd, 1) = 1;
+			}
+			$self->{nfds}++;
+		}
+
+		my $rout = '';
+		my $wout = '';
+		my $eout = '';
+		my $nfds = 0;
+
+		my $base = $loop->{time};
+
+		POLL_AGAIN: while ( $self->{nfds} ){
+
+			$nfds = select(
+				$rout = $self->{events}->[0],
+				$wout = $self->{events}->[1],
+				$eout = $self->{events}->[2],
+				$wait
+			);
+
+			## update time on every watch tick
+			$loop->update_time();
+
+			## an error
+			if ( $nfds == -1 ){
+				## on windows we may get an WSEINVAL error if we have all
+				## fd sets nulled this is an odd behaviour so we need to
+				## overcome a loop saturation
+				select(undef, undef, undef, 0.001) if $! == 10022;
+
+				## other errors should never happen
+				die $! if ( $! != EINTR );
+			}
+
+			## no events or error [ 0 || -1 ]
+			goto MAYBE_POLL_AGAIN if ($nfds <= 0 );
+
+			my $nevents = 0;
+			for ( keys %{ $self->{watchers} } ) {
+
+				my $w  = $self->{watchers}->{$_};
+
+				my $fd = $w->[0];
+				my $ev = $w->[1];
+				my $cb = $w->[2];
+
+				my $poll_event = 0;
+				if ($ev & $POLLIN){
+					$poll_event |= vec($rout, $fd, 1) ? $POLLIN : 0;
+				}
+
+				if ($ev & $POLLOUT){
+					$poll_event |= vec($wout, $fd, 1) ? $POLLOUT : 0;
+				}
+
+				if ($ev & $POLLERR){
+					$poll_event |= vec($eout, $fd, 1) ? $POLLERR : 0;
+				}
+
+				if ( $poll_event ){
+					delete $self->{watchers}->{$_};
+					$self->{nfds}--;
+
+					eval {
+						vec($self->{events}->[0], $fd, 1) = 0;
+						vec($self->{events}->[1], $fd, 1) = 0;
+						vec($self->{events}->[2], $fd, 1) = 0;
+					};
+
+					$cb->($fd, $poll_event);
+					$nevents++;
+
+					## io callback might call a timer function
+					## so we need to check if a new timeout has
+					## been updated
+					if ($loop->{timers}->[0]){
+						$wait = ($loop->{timers}->[0]->[0] - $base) / 1000;
+					}
+				}
+
+				last if $nevents == $nfds;
+			}
+
+			MAYBE_POLL_AGAIN: {
+				## there is no timers!! keep polling
+				goto POLL_AGAIN if !defined $wait;
+
+				## next timer time out should happen immediately
+				## leave io polling for now and check back on next tick
+				return if ($wait <= 0);
+
+				## update wait timeout
+				my $diff = ($self->{ loop }->{time} - $base) / 1000;
+				return if ($diff >= $wait);
+				$wait -= $diff;
+			}
+		}
+	}
 };
+
+
+
 
 
 package Tiny::Loop::Array; {

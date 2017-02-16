@@ -1,6 +1,6 @@
 use 5.010001;
 use ExtUtils::MakeMaker;
-
+#ignore
 WriteMakefile(
 		NAME              => 'Tiny::Loop',
 		VERSION_FROM      => 'lib/Tiny/Loop.pm',

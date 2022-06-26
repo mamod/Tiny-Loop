@@ -22,6 +22,7 @@ sub new {
 	return $self;
 }
 
+#hiiii
 
 sub now { shift->{time} }
 sub update_time {
